@@ -43,11 +43,11 @@ class AudioStreamer:
                     await self._client.cancel(ws, context_id)
                     break
 
-                data = await self._client.recv_message(ws)
-                msg_type = data.get("type")
+                message = await self._client.recv_message(ws)
+                msg_type = message.type
 
                 if msg_type == "chunk":
-                    pcm = base64.b64decode(data.get("data", ""))
+                    pcm = base64.b64decode(message.data or "")
                     if pcm:
                         pcm_buffer.extend(pcm)
                     if len(pcm_buffer) >= min_chunk_bytes:
@@ -57,7 +57,7 @@ class AudioStreamer:
                         yield self._encode_and_clear(pcm_buffer)
                     break
                 elif msg_type == "error":
-                    raise RuntimeError(data.get("error", "error"))
+                    raise RuntimeError(message.error or "error")
 
     async def stream_with_callbacks(
         self,
