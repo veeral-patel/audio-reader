@@ -6,8 +6,10 @@ import threading
 
 import streamlit as st
 from streamlit_audio_queue_player import audio_player
+from streamlit_autorefresh import st_autorefresh
 
-from cartesia_tts import TTSConfig, start_stream
+from audio_streamer import start_stream
+from cartesia_client import TTSConfig
 
 APP_VERSION = os.environ.get("CARTESIA_VERSION", "2025-04-16")
 APP_MODEL_ID = os.environ.get("CARTESIA_MODEL_ID", "sonic-2")
@@ -97,6 +99,8 @@ def render_app() -> None:
             clear_key=st.session_state.clear_key,
             key="audio_player",
         )
+        if st.session_state.tts_running or not st.session_state.tts_queue.empty():
+            st_autorefresh(interval=800, key="tts_refresh")
         try:
             status = st.session_state.tts_status.get_nowait()
             if status in {"done", "stopped"}:

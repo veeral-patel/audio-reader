@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from cartesia_tts import (
+from audio_streamer import (
     MAX_CHARS_PER_CHUNK,
-    TTSConfig,
-    build_payload,
     pcm16_to_wav_bytes,
     split_transcript,
 )
+from cartesia_client import CartesiaClient, TTSConfig
 
 
 def test_build_payload_basic() -> None:
@@ -17,7 +16,7 @@ def test_build_payload_basic() -> None:
         voice_id="voice",
         sample_rate=44100,
     )
-    payload = build_payload(config, "hello", "ctx", continue_flag=False)
+    payload = CartesiaClient(config)._build_payload("hello", "ctx", continue_flag=False)
     assert payload["model_id"] == "model"
     assert payload["voice"]["id"] == "voice"
     assert payload["output_format"]["sample_rate"] == 44100

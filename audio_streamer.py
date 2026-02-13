@@ -3,47 +3,48 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import queue
 import threading
 import uuid
 import wave
-from dataclasses import dataclass
-from typing import List, Protocol
+from typing import List
 
-import websockets
-
-MAX_CHARS_PER_CHUNK = 900
-MIN_CHUNK_SECONDS = 1.0
-WS_MAX_SIZE_BYTES = 8 * 1024 * 1024
-
-
-class WebSocketLike(Protocol):
-    async def send(self, data: str) -> None: ...
-
-    async def recv(self) -> str: ...
+from cartesia_client import (
+    MAX_CHARS_PER_CHUNK,
+    MIN_CHUNK_SECONDS,
+    CartesiaClient,
+    TTSConfig,
+    WebSocketLike,
+    validate_config,
+)
 
 
-@dataclass(frozen=True)
-class TTSConfig:
-    api_key: str
-    version: str
-    model_id: str
-    voice_id: str
-    sample_rate: int
-    language: str = "en"
+def start_stream(
+    text: str,
+    config: TTSConfig,
+    audio_queue: queue.Queue[str],
+    status_queue: queue.Queue[str],
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """Convenience entrypoint for starting a stream in a thread."""
+    validate_config(config)
+    streamer = AudioStreamer(
+        CartesiaClient(config), audio_queue, status_queue, stop_event
+    )
+    return streamer.start(text)
 
 
-class CartesiaStreamer:
+class AudioStreamer:
     """Stream Cartesia TTS audio into a queue of base64-encoded WAV chunks."""
+
     def __init__(
         self,
-        config: TTSConfig,
+        client: CartesiaClient,
         audio_queue: queue.Queue[str],
         status_queue: queue.Queue[str],
         stop_event: threading.Event,
     ) -> None:
-        self._config = config
+        self._client = client
         self._audio_queue = audio_queue
         self._status_queue = status_queue
         self._stop_event = stop_event
@@ -60,15 +61,13 @@ class CartesiaStreamer:
     async def _stream(self, text: str) -> None:
         """Open a websocket, send chunks, and stream audio back."""
         try:
-            validate_config(self._config)
+            validate_config(self._client.config)
             context_id = str(uuid.uuid4())
             self._pcm_buffer = bytearray()
             self._min_chunk_bytes_per_flush = int(
-                self._config.sample_rate * 2 * MIN_CHUNK_SECONDS
+                self._client.config.sample_rate * 2 * MIN_CHUNK_SECONDS
             )
-            async with websockets.connect(
-                build_ws_url(self._config), max_size=WS_MAX_SIZE_BYTES
-            ) as ws:
+            async with self._client.connect() as ws:
                 await self._send_chunks(ws, text, context_id)
                 await self._recv_loop(ws, context_id)
         except Exception as exc:
@@ -79,31 +78,25 @@ class CartesiaStreamer:
         chunks = split_transcript(text, max_chars=MAX_CHARS_PER_CHUNK)
         for idx, chunk in enumerate(chunks):
             if self._stop_event.is_set():
-                await self._cancel(ws, context_id)
+                await self._client.cancel(ws, context_id)
                 self._status_queue.put("stopped")
                 return
-            payload = build_payload(
-                self._config,
+            await self._client.send_chunk(
+                ws,
                 chunk + (" " if idx < len(chunks) - 1 else ""),
                 context_id,
                 continue_flag=idx < len(chunks) - 1,
             )
-            await ws.send(json.dumps(payload))
 
     async def _recv_loop(self, ws: WebSocketLike, context_id: str) -> None:
         """Receive audio chunks from the websocket and enqueue WAV data."""
         while True:
             if self._stop_event.is_set():
-                await self._cancel(ws, context_id)
+                await self._client.cancel(ws, context_id)
                 self._status_queue.put("stopped")
                 break
 
-            raw = await ws.recv()
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                self._status_queue.put("error: invalid JSON from server")
-                break
+            data = await self._client.recv_message(ws)
             msg_type = data.get("type")
 
             if msg_type == "chunk":
@@ -128,55 +121,11 @@ class CartesiaStreamer:
         """Convert buffered PCM to WAV and enqueue it."""
         if not self._pcm_buffer:
             return
-        wav_bytes = pcm16_to_wav_bytes(bytes(self._pcm_buffer), self._config.sample_rate)
+        wav_bytes = pcm16_to_wav_bytes(
+            bytes(self._pcm_buffer), self._client.config.sample_rate
+        )
         self._audio_queue.put(base64.b64encode(wav_bytes).decode())
         self._pcm_buffer.clear()
-
-    async def _cancel(self, ws: WebSocketLike, context_id: str) -> None:
-        """Cancel the current streaming context."""
-        await ws.send(json.dumps({"context_id": context_id, "cancel": True}))
-
-
-def start_stream(
-    text: str,
-    config: TTSConfig,
-    audio_queue: queue.Queue[str],
-    status_queue: queue.Queue[str],
-    stop_event: threading.Event,
-) -> threading.Thread:
-    """Convenience entrypoint for starting a stream in a thread."""
-    validate_config(config)
-    streamer = CartesiaStreamer(config, audio_queue, status_queue, stop_event)
-    return streamer.start(text)
-
-
-def build_ws_url(config: TTSConfig) -> str:
-    """Build the Cartesia WebSocket URL with auth and version."""
-    return (
-        "wss://api.cartesia.ai/tts/websocket"
-        f"?api_key={config.api_key}"
-        f"&cartesia_version={config.version}"
-    )
-
-
-def build_payload(
-    config: TTSConfig, transcript: str, context_id: str, continue_flag: bool
-) -> dict:
-    """Build a single Cartesia TTS payload for a transcript chunk."""
-    return {
-        "model_id": config.model_id,
-        "transcript": transcript,
-        "voice": {"mode": "id", "id": config.voice_id},
-        "language": config.language,
-        "context_id": context_id,
-        "output_format": {
-            "container": "raw",
-            "encoding": "pcm_s16le",
-            "sample_rate": config.sample_rate,
-        },
-        "add_timestamps": False,
-        "continue": continue_flag,
-    }
 
 
 def pcm16_to_wav_bytes(pcm_data: bytes, sample_rate: int, channels: int = 1) -> bytes:
@@ -231,11 +180,3 @@ def split_transcript(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> List[st
         chunks.append(current)
 
     return chunks
-
-
-def validate_config(config: TTSConfig) -> None:
-    """Validate required config values."""
-    if not config.api_key:
-        raise ValueError("Cartesia API key is required")
-    if config.sample_rate <= 0:
-        raise ValueError("Sample rate must be positive")
