@@ -7,7 +7,7 @@ import queue
 import threading
 import uuid
 import wave
-from typing import List
+from typing import AsyncIterator, Callable, List, Optional, Tuple
 
 from cartesia_client import (
     MAX_CHARS_PER_CHUNK,
@@ -19,67 +19,107 @@ from cartesia_client import (
 )
 
 
-def start_stream(
-    text: str,
-    config: TTSConfig,
-    audio_queue: queue.Queue[str],
-    status_queue: queue.Queue[str],
-    stop_event: threading.Event,
-) -> threading.Thread:
-    """Convenience entrypoint for starting a stream in a thread."""
-    validate_config(config)
-    streamer = AudioStreamer(
-        CartesiaClient(config), audio_queue, status_queue, stop_event
-    )
-    return streamer.start(text)
-
-
 class AudioStreamer:
-    """Stream Cartesia TTS audio into a queue of base64-encoded WAV chunks."""
+    """Stream Cartesia TTS audio into base64-encoded WAV chunks."""
 
-    def __init__(
+    def __init__(self, client: CartesiaClient) -> None:
+        self._client = client
+
+    async def stream(
+        self, text: str, stop_event: Optional[threading.Event] = None
+    ) -> AsyncIterator[str]:
+        """Yield base64 WAV chunks from a streaming TTS session."""
+        validate_config(self._client._config)
+        stop_event = stop_event or threading.Event()
+        context_id = str(uuid.uuid4())
+        pcm_buffer = bytearray()
+        min_chunk_bytes = int(self._client._config.sample_rate * 2 * MIN_CHUNK_SECONDS)
+
+        async with self._client.connect() as ws:
+            await self._send_chunks(ws, text, context_id, stop_event)
+
+            while True:
+                if stop_event.is_set():
+                    await self._client.cancel(ws, context_id)
+                    break
+
+                data = await self._client.recv_message(ws)
+                msg_type = data.get("type")
+
+                if msg_type == "chunk":
+                    pcm = base64.b64decode(data.get("data", ""))
+                    if pcm:
+                        pcm_buffer.extend(pcm)
+                    if len(pcm_buffer) >= min_chunk_bytes:
+                        yield self._encode_and_clear(pcm_buffer)
+                elif msg_type == "done":
+                    if pcm_buffer:
+                        yield self._encode_and_clear(pcm_buffer)
+                    break
+                elif msg_type == "error":
+                    raise RuntimeError(data.get("error", "error"))
+
+    async def stream_with_callbacks(
         self,
-        client: CartesiaClient,
-        audio_queue: queue.Queue[str],
-        status_queue: queue.Queue[str],
+        text: str,
+        on_audio: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Stream audio and push chunks/status via callbacks."""
+        stop_event = stop_event or threading.Event()
+        if on_status:
+            on_status("starting")
+        try:
+            async for chunk in self.stream(text, stop_event=stop_event):
+                if on_status:
+                    on_status("streaming")
+                on_audio(chunk)
+            if on_status:
+                on_status("done")
+        except Exception as exc:
+            if on_status:
+                on_status(f"error: {exc}")
+            else:
+                raise
+
+    def start_session(
+        self,
+        text: str,
+        audio_queue: Optional[queue.Queue[str]] = None,
+        status_queue: Optional[queue.Queue[str]] = None,
+    ) -> Tuple[threading.Thread, threading.Event]:
+        """Start a background session that writes chunks into queues."""
+        audio_queue = audio_queue or queue.Queue()
+        status_queue = status_queue or queue.Queue()
+        stop_event = threading.Event()
+
+        def on_audio(chunk: str) -> None:
+            audio_queue.put(chunk)
+
+        def on_status(status: str) -> None:
+            status_queue.put(status)
+
+        thread = threading.Thread(
+            target=lambda: asyncio.run(
+                self.stream_with_callbacks(text, on_audio, on_status, stop_event)
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return thread, stop_event
+
+    async def _send_chunks(
+        self,
+        ws: WebSocketLike,
+        text: str,
+        context_id: str,
         stop_event: threading.Event,
     ) -> None:
-        self._client = client
-        self._audio_queue = audio_queue
-        self._status_queue = status_queue
-        self._stop_event = stop_event
-
-    def start(self, text: str) -> threading.Thread:
-        """Start streaming in a background thread and return the thread."""
-        thread = threading.Thread(target=self._run, args=(text,), daemon=True)
-        thread.start()
-        return thread
-
-    def _run(self, text: str) -> None:
-        asyncio.run(self._stream(text))
-
-    async def _stream(self, text: str) -> None:
-        """Open a websocket, send chunks, and stream audio back."""
-        try:
-            validate_config(self._client.config)
-            context_id = str(uuid.uuid4())
-            self._pcm_buffer = bytearray()
-            self._min_chunk_bytes_per_flush = int(
-                self._client.config.sample_rate * 2 * MIN_CHUNK_SECONDS
-            )
-            async with self._client.connect() as ws:
-                await self._send_chunks(ws, text, context_id)
-                await self._recv_loop(ws, context_id)
-        except Exception as exc:
-            self._status_queue.put(f"error: {exc}")
-
-    async def _send_chunks(self, ws: WebSocketLike, text: str, context_id: str) -> None:
-        """Split text and send each chunk to the websocket."""
         chunks = split_transcript(text, max_chars=MAX_CHARS_PER_CHUNK)
         for idx, chunk in enumerate(chunks):
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 await self._client.cancel(ws, context_id)
-                self._status_queue.put("stopped")
                 return
             await self._client.send_chunk(
                 ws,
@@ -88,44 +128,10 @@ class AudioStreamer:
                 continue_flag=idx < len(chunks) - 1,
             )
 
-    async def _recv_loop(self, ws: WebSocketLike, context_id: str) -> None:
-        """Receive audio chunks from the websocket and enqueue WAV data."""
-        while True:
-            if self._stop_event.is_set():
-                await self._client.cancel(ws, context_id)
-                self._status_queue.put("stopped")
-                break
-
-            data = await self._client.recv_message(ws)
-            msg_type = data.get("type")
-
-            if msg_type == "chunk":
-                pcm = base64.b64decode(data.get("data", ""))
-                if pcm:
-                    self._handle_chunk(pcm)
-            elif msg_type == "done":
-                self._flush_buffer()
-                self._status_queue.put("done")
-                break
-            elif msg_type == "error":
-                self._status_queue.put(data.get("error", "error"))
-                break
-
-    def _handle_chunk(self, pcm: bytes) -> None:
-        """Buffer PCM until threshold then flush as WAV."""
-        self._pcm_buffer.extend(pcm)
-        if len(self._pcm_buffer) >= self._min_chunk_bytes_per_flush:
-            self._flush_buffer()
-
-    def _flush_buffer(self) -> None:
-        """Convert buffered PCM to WAV and enqueue it."""
-        if not self._pcm_buffer:
-            return
-        wav_bytes = pcm16_to_wav_bytes(
-            bytes(self._pcm_buffer), self._client.config.sample_rate
-        )
-        self._audio_queue.put(base64.b64encode(wav_bytes).decode())
-        self._pcm_buffer.clear()
+    def _encode_and_clear(self, buffer: bytearray) -> str:
+        wav_bytes = pcm16_to_wav_bytes(bytes(buffer), self._client._config.sample_rate)
+        buffer.clear()
+        return base64.b64encode(wav_bytes).decode()
 
 
 def pcm16_to_wav_bytes(pcm_data: bytes, sample_rate: int, channels: int = 1) -> bytes:
