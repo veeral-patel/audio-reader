@@ -13,6 +13,83 @@ MIN_CHUNK_SECONDS = 1.0
 WS_MAX_SIZE_BYTES = 8 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class OutputFormat:
+    container: str
+    encoding: str
+    sample_rate: int
+
+
+@dataclass(frozen=True)
+class VoiceRef:
+    mode: str
+    id: str
+
+
+@dataclass(frozen=True)
+class TTSRequest:
+    model_id: str
+    transcript: str
+    voice: VoiceRef
+    language: str
+    context_id: str
+    output_format: OutputFormat
+    add_timestamps: bool
+    continue_flag: bool
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "model_id": self.model_id,
+                "transcript": self.transcript,
+                "voice": {"mode": self.voice.mode, "id": self.voice.id},
+                "language": self.language,
+                "context_id": self.context_id,
+                "output_format": {
+                    "container": self.output_format.container,
+                    "encoding": self.output_format.encoding,
+                    "sample_rate": self.output_format.sample_rate,
+                },
+                "add_timestamps": self.add_timestamps,
+                "continue": self.continue_flag,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class TTSMessage:
+    type: str
+    data: Optional[str] = None
+    error: Optional[str] = None
+
+    @staticmethod
+    def from_json(raw: str) -> "TTSMessage":
+        payload = json.loads(raw)
+        return TTSMessage(
+            type=payload.get("type", ""),
+            data=payload.get("data"),
+            error=payload.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class CancelMessage:
+    context_id: str
+    cancel: bool
+
+    def to_json(self) -> str:
+        return json.dumps({"context_id": self.context_id, "cancel": self.cancel})
+
+
+@dataclass(frozen=True)
+class ErrorMessage:
+    type: str
+    error: str
+
+    def to_message(self) -> "TTSMessage":
+        return TTSMessage(type=self.type, error=self.error)
+
+
 class WebSocketLike(Protocol):
     """Minimal websocket interface used by CartesiaClient."""
     async def send(self, data: str) -> None: ...
@@ -83,12 +160,12 @@ class CartesiaClient:
             return TTSMessage.from_json(raw)
         except json.JSONDecodeError:
             self._logger.error("Invalid JSON received from server")
-            return TTSMessage(type="error", error="invalid JSON from server")
+            return ErrorMessage(type="error", error="invalid JSON from server").to_message()
 
     async def cancel(self, ws: WebSocketLike, context_id: str) -> None:
         """Cancel an active Cartesia streaming context."""
         self._logger.info("Canceling stream context_id=%s", context_id)
-        await ws.send(json.dumps({"context_id": context_id, "cancel": True}))
+        await ws.send(CancelMessage(context_id=context_id, cancel=True).to_json())
 
 
 
@@ -101,61 +178,3 @@ def validate_config(config: TTSConfig) -> None:
         logging.getLogger(__name__).error("Invalid sample rate: %s", config.sample_rate)
         raise ValueError("Sample rate must be positive")
 
-
-@dataclass(frozen=True)
-class OutputFormat:
-    container: str
-    encoding: str
-    sample_rate: int
-
-
-@dataclass(frozen=True)
-class VoiceRef:
-    mode: str
-    id: str
-
-
-@dataclass(frozen=True)
-class TTSRequest:
-    model_id: str
-    transcript: str
-    voice: VoiceRef
-    language: str
-    context_id: str
-    output_format: OutputFormat
-    add_timestamps: bool
-    continue_flag: bool
-
-    def to_json(self) -> str:
-        return json.dumps(
-            {
-                "model_id": self.model_id,
-                "transcript": self.transcript,
-                "voice": {"mode": self.voice.mode, "id": self.voice.id},
-                "language": self.language,
-                "context_id": self.context_id,
-                "output_format": {
-                    "container": self.output_format.container,
-                    "encoding": self.output_format.encoding,
-                    "sample_rate": self.output_format.sample_rate,
-                },
-                "add_timestamps": self.add_timestamps,
-                "continue": self.continue_flag,
-            }
-        )
-
-
-@dataclass(frozen=True)
-class TTSMessage:
-    type: str
-    data: Optional[str] = None
-    error: Optional[str] = None
-
-    @staticmethod
-    def from_json(raw: str) -> "TTSMessage":
-        payload = json.loads(raw)
-        return TTSMessage(
-            type=payload.get("type", ""),
-            data=payload.get("data"),
-            error=payload.get("error"),
-        )
