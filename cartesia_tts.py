@@ -118,6 +118,17 @@ class CartesiaStreamer:
         self._audio_queue.put(base64.b64encode(wav_bytes).decode())
 
 
+def start_stream(
+    text: str,
+    config: TTSConfig,
+    audio_queue: queue.Queue,
+    status_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    streamer = CartesiaStreamer(config, audio_queue, status_queue, stop_event)
+    return streamer.start(text)
+
+
 def pcm16_to_wav_bytes(pcm_data: bytes, sample_rate: int, channels: int = 1) -> bytes:
     if len(pcm_data) % 2 != 0:
         pcm_data = pcm_data[:-1]
