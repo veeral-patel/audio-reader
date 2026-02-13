@@ -8,7 +8,6 @@ import json
 
 import websockets
 
-MAX_CHARS_PER_CHUNK = 900
 MIN_CHUNK_SECONDS = 1.0
 WS_MAX_SIZE_BYTES = 8 * 1024 * 1024
 
@@ -177,4 +176,3 @@ def validate_config(config: TTSConfig) -> None:
     if config.sample_rate <= 0:
         logging.getLogger(__name__).error("Invalid sample rate: %s", config.sample_rate)
         raise ValueError("Sample rate must be positive")
-
