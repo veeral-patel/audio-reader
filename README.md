@@ -148,3 +148,67 @@ streamlit run app.py
 - If audio cuts out, try lowering passage length or sample rate.
 - If playback is muffled, increase sample rate or buffer size.
 - If you see errors in the UI, check your API key and network access.
+
+## Queue and thread flow
+
+The app uses a background thread plus a queue to stream audio without blocking the UI.
+
+### Step-by-step
+
+1) `ui.py` starts a background thread via `AudioStreamer.start_session(...)`.
+2) The thread runs the async streaming loop and receives audio chunks.
+3) Each audio chunk is placed into a thread-safe `audio_queue`.
+4) On every Streamlit rerun, the UI pulls **one** chunk from the queue.
+5) The audio player queues that chunk for playback.
+6) `st_autorefresh(...)` keeps the UI rerunning until the stream is done.
+
+### Example flow (pseudo)
+
+```text
+UI thread:         Background thread:
+
+click Play         -> open WebSocket
+start_session      -> receive PCM chunk
+rerun UI           -> audio_queue.put(chunk)
+get_nowait()       -> receive PCM chunk
+audio_player(...)  -> audio_queue.put(chunk)
+rerun UI           -> ...
+```
+
+### WebSocket stream visualization
+
+```text
+Client -> Cartesia (send text chunks)
+
+  [chunk 1] ---->
+  [chunk 2] ---->
+  [chunk 3] ---->  (continue=true on chunks 1..n-1)
+
+Cartesia -> Client (receive audio chunks)
+
+  <---- PCM #1 (base64)
+  <---- PCM #2 (base64)
+  <---- PCM #3 (base64)
+  <---- done
+```
+
+### WAV assembly visualization
+
+```text
+PCM buffer (bytes) grows over time:
+
+  +---------+---------+---------+
+  | PCM #1  | PCM #2  | PCM #3  |
+  +---------+---------+---------+
+
+When buffer >= min_chunk_bytes:
+  -> wrap PCM buffer in WAV header
+  -> base64 encode WAV bytes
+  -> push to UI queue
+```
+
+### Why this pattern
+
+- Streamlit UI can’t block on network I/O.
+- A queue is thread-safe for producer/consumer flow.
+- Autorefresh turns the UI into a steady consumer of chunks.
